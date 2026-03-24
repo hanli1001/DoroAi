@@ -1,0 +1,47 @@
+# 动作优先级：数字越大优先级越高
+# 闲置动作（优先级1）
+idle:
+  - id: idle_default
+    name: 默认闲置
+    path: "resources/images/logo.png"
+    duration: 3000
+    weight: 3
+
+# 情绪动作（优先级7）
+emotion:
+  - id: happy_feed
+    name: 投喂开心
+    path: "resources/animations/emotion/happy.gif"
+    duration: 4000
+    trigger: ["feed"]
+  - id: sad_ignore
+    name: 被冷落委屈
+    path: "resources/animations/emotion/sad.gif"
+    duration: 3500
+    trigger: ["ignore"]
+
+# 交互动作（优先级5）
+interact:
+  - id: click_tsundere
+    name: 点击傲娇
+    path: "resources/animations/interact/tsundere.gif"
+    duration: 2000
+    trigger: ["left_click"]
+  - id: hover_clingy
+    name: 悬停贴贴
+    path: "resources/animations/interact/clingy.gif"
+    duration: 2500
+    trigger: ["mouse_hover"]
+
+# 命令动作（优先级9）
+command:
+  - id: dance
+    name: 跳舞
+    path: "resources/animations/command/dance.gif"
+    duration: 5000
+    command: ["dance", "跳舞", "跳个舞"]
+  - id: sleep
+    name: 睡觉
+    path: "resources/animations/command/sleep.gif"
+    duration: -1
+    command: ["sleep", "睡觉", "晚安"]

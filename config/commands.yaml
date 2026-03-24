@@ -1,0 +1,17 @@
+commands:
+  - name: 投喂橘子
+    keywords: ["喂橘子", "投喂", "吃橘子", "哦润吉"]
+    action_id: "happy_feed"
+    ai_reply: "哇！是甜甜的橘子！Doro超爱你！🍊"
+    memory_update: {"orange_count": "+1"}
+    cooldown: 3000
+
+  - name: 查看投喂次数
+    keywords: ["喂了多少橘子", "投喂次数", "橘子数量"]
+    action_id: "idle_default"
+    ai_reply: "你已经给Doro喂了{orange_count}个橘子啦！Doro会记一辈子的！"
+
+  - name: 查看背景故事
+    keywords: ["你的故事", "背景故事", "你是谁"]
+    action_id: "idle_default"
+    ai_reply: "Doro是从伊甸园来的粉毛小狗，专门顺着网线来找你陪我吃橘子呀~"
