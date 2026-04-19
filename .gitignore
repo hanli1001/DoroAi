@@ -26,6 +26,7 @@ env/
 ENV/
 
 # 配置与密钥
+DoroAi/
 config/settings.yaml
 user_memory.json
 
