@@ -1,7 +1,7 @@
 commands:
   - name: 投喂橘子
     keywords: ["喂橘子", "投喂", "吃橘子", "哦润吉"]
-    action_id: "happy_feed"
+    action_id: "sleep"
     ai_reply: "哇！是甜甜的橘子！Doro超爱你！🍊"
     memory_update: {"orange_count": "+1"}
     cooldown: 3000

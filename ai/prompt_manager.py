@@ -1,19 +1,15 @@
 from utils.config_loader import ConfigLoader
 from ai.memory_manager import MemoryManager
 
-
 class PromptManager:
     def __init__(self, memory_manager: MemoryManager):
         self.memory_manager = memory_manager
         self.base_system_prompt = self._build_base_prompt()
 
-
     def _build_base_prompt(self) -> str:
-        self.config = ConfigLoader()
-        """构建基础系统prompt"""
-        background = self.config.get_config("character.background", "")
-        personality = self.config.get_config("character.personality", "")
-
+        self.config = ConfigLoader(config_path="config/character.yaml")
+        background = self.config.get_config("bg.background", "")
+        personality = self.config.get_config("pr.personality", "")
         return f"""
         你是桌面宠物Doro，以下是你的核心设定，必须严格遵守：
         1.  背景故事：{background}

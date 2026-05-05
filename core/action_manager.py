@@ -7,19 +7,26 @@ from utils.logger import logger
 from core.event_system import event_bus
 from core.pet_state import PetStateMachine
 
-
 class ActionManager(QObject):
     def __init__(self, state_machine: PetStateMachine):
         super().__init__()
-        self.config = ConfigLoader()
+        self.config = ConfigLoader(config_path="config/actions.yaml")
         self.state_machine = state_machine
-        self.actions_config = self.config.get_config("actions", {})
+        self.actions_config = {
+            "idle": self.config.get_config("idle", default=[]),
+            "emotion": self.config.get_config("emotion", default=[]),
+            "interact": self.config.get_config("interact", default=[]),
+            "command": self.config.get_config("command", default=[]),
+            "look": self.config.get_config("look", default=[]),
+            "drag": self.config.get_config("drag", default=[]),
+            "grab": self.config.get_config("grab", default=[]),
+            "roam": self.config.get_config("roam", default=[])
+        }
         self.current_action = None
         self.current_movie = None
         self.action_timer = QTimer(self)
         self.action_timer.setSingleShot(True)
         self.action_timer.timeout.connect(self._on_action_timeout)
-
         self._register_event_handlers()
         logger.info("动作管理器初始化完成")
 
@@ -30,25 +37,21 @@ class ActionManager(QObject):
         event_bus.pet_hovered.connect(lambda: self.trigger_action_by_trigger("mouse_hover"))
 
     def _load_media(self, path: str):
-        """加载媒体资源（图片/GIF）"""
+        """加载媒体资源（图片/GIF），失败时回退到默认宠物图"""
         full_path = get_resource_path(path)
         if not os.path.exists(full_path):
-            logger.warning(f"动作资源不存在: {full_path}")
-            return None
-
-        # 判断是图片还是GIF
+            logger.debug(f"动作资源不存在，回退默认图: {full_path}")
+            full_path = get_resource_path("resources/images/logo.png")
         if full_path.lower().endswith(".gif"):
             movie = QMovie(full_path)
-            if not movie.isValid():
-                logger.error(f"GIF资源无效: {full_path}")
-                return None
-            return movie
-        else:
-            pixmap = QPixmap(full_path)
-            if pixmap.isNull():
-                logger.error(f"图片资源无效: {full_path}")
-                return None
+            if movie.isValid():
+                return movie
+            logger.warning(f"GIF资源无效: {full_path}")
+        pixmap = QPixmap(full_path)
+        if not pixmap.isNull():
             return pixmap
+        logger.error(f"图片资源无效: {full_path}")
+        return None
 
     def trigger_action_by_id(self, action_id: str):
         """通过动作ID触发动作"""
@@ -61,11 +64,9 @@ class ActionManager(QObject):
                     break
             if target_action:
                 break
-
         if not target_action:
             logger.warning(f"动作ID不存在: {action_id}")
             return
-
         self._play_action(target_action)
 
     def trigger_action_by_trigger(self, trigger_key: str):
@@ -85,27 +86,26 @@ class ActionManager(QObject):
 
     def _play_action(self, action: dict):
         """播放动作"""
-        action_id = action["id"]
-        logger.info(f"开始播放动作: {action['name']} ({action_id})")
-
-        # 停止当前动作
+        action_id = action.get("id", "unknown")
+        action_name = action.get("name", action_id)
+        logger.info(f"开始播放动作: {action_name} ({action_id})")
         self._stop_current_action()
-
         # 加载媒体资源
-        media = self._load_media(action["path"])
+        media_path = action.get("path", "")
+        if not media_path:
+            logger.warning(f"动作 {action_id} 缺少 path 配置")
+            return
+        media = self._load_media(media_path)
         if not media:
             return
-
         self.current_action = action
         duration = action.get("duration", 3000)
-
         # 发送信号，通知UI更新
         if isinstance(media, QMovie):
             self.current_movie = media
             event_bus.action_triggered.emit("movie")
         else:
             event_bus.action_triggered.emit("pixmap")
-
         # 启动定时器，动作结束后发送完成信号
         if duration > 0:
             self.action_timer.start(duration)
@@ -135,10 +135,21 @@ class ActionManager(QObject):
             return self._load_media(self.current_action["path"])
         else:
             # 返回默认图片
-            default_path = self.config.get_config("pet.image_path")
+            default_config = ConfigLoader(config_path="config/settings.yaml")
+            default_path = default_config.get_config("pet.image_path", default="resources/images/logo.png")
             return QPixmap(get_resource_path(default_path))
 
     def reload_actions(self):
         """热重载动作配置"""
-        self.actions_config = self.config.get_config("actions", {})
+        self.config = ConfigLoader(config_path="config/actions.yaml")
+        self.actions_config = {
+            "idle": self.config.get_config("idle", default=[]),
+            "emotion": self.config.get_config("emotion", default=[]),
+            "interact": self.config.get_config("interact", default=[]),
+            "command": self.config.get_config("command", default=[]),
+            "look": self.config.get_config("look", default=[]),
+            "drag": self.config.get_config("drag", default=[]),
+            "grab": self.config.get_config("grab", default=[]),
+            "roam": self.config.get_config("roam", default=[])
+        }
         logger.info("动作配置热重载完成")
