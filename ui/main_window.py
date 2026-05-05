@@ -1,536 +1,551 @@
-import random
-import json
-import os
-import sys
+import random, json, sys
 from utils.config_loader import ConfigLoader
-from PySide6.QtWidgets import QLabel, QWidget, QApplication, QLineEdit, QPushButton
-from PySide6.QtGui import QPixmap, QMovie, Qt
-from PySide6.QtCore import QPoint, QElapsedTimer, QThread, QTimer, QObject
-from utils.logger import logger
+from PySide6.QtWidgets import QWidget, QApplication
+from PySide6.QtGui import QPixmap, QMovie, Qt, QPainter
+from PySide6.QtCore import QPoint, QElapsedTimer, QThread, QTimer, QPropertyAnimation, QEasingCurve, QRect
 from utils.path_utils import get_resource_path
-from core.event_system import event_bus
-from core.pet_state import PetStateMachine
-from core.action_manager import ActionManager
-from core.command_parser import CommandParser
-from ai.ai_worker import AIWorker
-from ai.memory_manager import MemoryManager
-from ui.bubble_widget import BubbleLabel
+from utils.logger import logger
 from ui.menu_widget import PetMenu
 from ui.about_dialog import AboutDoroDialog
+from ui.orange_widget import OrangeWidget
+from ui.screen_capture import ScreenCaptureWidget
+from ui.answer_overlay import AnswerOverlay
+from ui.chat_panel import ChatPanel
+from ui.bubble_renderer import BubbleRenderer
+from core.event_system import event_bus
+from core.pet_state import PetStateMachine, PetState
+from core.action_manager import ActionManager
+from core.command_parser import CommandParser
+from core.ocr_worker import OCRWorker
+from ai.ai_worker import AIWorker
+from ai.memory_manager import MemoryManager
+from utils.tts_engine import TTSEngine
 
 
 class PetMainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        # 全局配置单例（最先初始化）
         self.config = ConfigLoader()
+        self.char_config = ConfigLoader(config_path="config/character.yaml")
 
-        # 初始化核心业务模块
+        self._mouse_start_pos = QPoint(); self._window_start_pos = QPoint()
+        self._is_dragging = False
+        self._move_threshold = self.config.get_config("window.move_threshold", default=10)
+        self._click_threshold = self.config.get_config("window.click_threshold", default=400)
+        self._press_timer = QElapsedTimer()
+        self.last_interact_time = QElapsedTimer(); self.last_interact_time.start()
+        self.current_reply = ""
+        self._last_ocr_text = ""
+        self._conversation_history = []
+        self._is_ocr_answer = False
+
         self.memory_manager = MemoryManager()
         self.state_machine = PetStateMachine()
         self.action_manager = ActionManager(self.state_machine)
         self.command_parser = CommandParser(self.memory_manager)
+        self.tts_engine = TTSEngine(self.config.get_config)
 
-        # ====================== 拖拽核心参数（手感可直接微调） ======================
-        self._is_dragging = False
-        self._window_start_pos = QPoint()
-        self._mouse_start_pos = QPoint()
-        # 移动阈值：2=平衡跟手&防误触，1=极致跟手，3=完全防误触
-        self._move_threshold = self.config.get_config("window.move_threshold", 2)
-        # 点击阈值：250ms，避免拖拽误判为点击
-        self._click_threshold = self.config.get_config("window.click_threshold", 250)
-        self._press_timer = QElapsedTimer()
+        self.orange_widget = None
+        self.orange_grab_threshold = self.config.get_config("orange.grab_threshold", default=150)
+        self.orange_grab_chance = self.config.get_config("orange.grab_chance", default=0.6)
+        self.orange_chase_speed = self.config.get_config("orange.chase_speed", default=0.1)
+        self.is_chasing = False
 
-        # 界面状态管理
-        self.is_panel_show = False
-        self.current_reply = ""
-        # 用户互动计时器
-        self.last_interact_time = QElapsedTimer()
-        self.last_interact_time.start()
+        self.roam_timer = QTimer(self); self.roam_timer.timeout.connect(self.trigger_roam)
+        self.roam_min_interval = self.config.get_config("roam.min_interval", default=10000)
+        self.roam_max_interval = self.config.get_config("roam.max_interval", default=30000)
+        self.roam_min_duration = self.config.get_config("roam.min_duration", default=1000)
+        self.roam_max_duration = self.config.get_config("roam.max_duration", default=8000)
+        self.roam_animation = None; self.is_roaming = False
 
-        # 按顺序初始化所有模块
+        self.bubble = BubbleRenderer(self.config.get_config)
+        self.answer_overlay = AnswerOverlay()
+        self.chat_panel = ChatPanel(self)
+        self.chat_panel.message_sent.connect(self._on_user_message)
+
+        # OCR 语音逐句播放状态
+        self._ocr_sentences = []
+        self._ocr_speak_idx = 0
+        self._ocr_speaking = False
+        self._ocr_paused = False
+        self.answer_overlay.set_play_callback(self._ocr_play)
+        self.answer_overlay.set_pause_callback(self._ocr_pause)
+        self.answer_overlay.set_stop_callback(self._ocr_stop)
+        self.tts_engine.tts_finished.connect(self._on_ocr_sentence_done)
+
         self.initUI()
         self.init_ai_thread()
+        self.init_ocr_thread()
         self.init_timers()
         self._register_event_handlers()
+        self.show_doro_line("汪呜～人，你好！我是Doro～")
 
+    # ── Windows 鼠标穿透修复 ──
+    def nativeEvent(self, eventType, message):
+        if sys.platform != "win32":
+            return super().nativeEvent(eventType, message)
+        try:
+            import ctypes; from PySide6.QtCore import QByteArray
+            if eventType != QByteArray(b"windows_generic_MSG"):
+                return super().nativeEvent(eventType, message)
+            class MSG(ctypes.Structure):
+                _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+                            ("wParam", ctypes.c_ulonglong), ("lParam", ctypes.c_longlong),
+                            ("time", ctypes.c_uint), ("pt_x", ctypes.c_long), ("pt_y", ctypes.c_long)]
+            msg = ctypes.cast(message, ctypes.POINTER(MSG)).contents
+            if msg.message == 0x0084: return True, 1
+        except Exception: pass
+        return super().nativeEvent(eventType, message)
+
+    # ── UI 初始化 ──
     def initUI(self):
-        # ====================== 1. 窗口基础配置 ======================
-        window_width = self.config.get_config("settings.window.width", 400)
-        window_height = self.config.get_config("settings.window.height", 400)
+        window_width = self.config.get_config("window.width", default=400)
+        window_height = self.config.get_config("window.height", default=300)
         self.setFixedSize(window_width, window_height)
 
-        # 无边框、置顶、全透明基础配置
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.setStyleSheet("QWidget {background-color: transparent;}")
-
-        # ====================== 【根治闪烁核心】Windows分层窗口硬件加速 ======================
-        if sys.platform == "win64":
-            try:
-                from PySide6.QtWinExtras import QtWin
-                # 开启Windows分层窗口，启用GPU硬件加速渲染，彻底解决透明窗口拖动闪烁
-                QtWin.setWindowExtendedStyle(
-                    self,
-                    QtWin.WS_EX_LAYERED | QtWin.WS_EX_TRANSPARENT
-                )
-                # 关闭窗口阴影，避免拖动时的重绘开销
-                self.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
-            except ImportError:
-                logger.warning("QtWinExtras模块未找到，跳过Windows硬件加速优化")
-
-        # ====================== 【渲染优化】关闭多余重绘，开启双缓冲防撕裂 ======================
-        self.setAttribute(Qt.WA_PaintOnScreen, False)
+        self.setAutoFillBackground(False)
         self.setUpdatesEnabled(True)
 
-        # 后面的右键菜单、宠物图片、输入框等原有代码，保持不变
-
-        # ====================== 2. 右键菜单 ======================
-        self.right_menu = PetMenu(self)
+        self.tts_enabled = self.config.get_config("tts.enabled", default=True)
+        self.tts_backend = self.config.get_config("tts.backend", default="gpt_sovits")
+        self.right_menu = PetMenu()
+        self.right_menu.set_tts_enabled(self.tts_enabled)
+        self.right_menu.set_backend(self.tts_backend)
         self.right_menu.feed_orange.connect(self.on_feed_orange)
         self.right_menu.show_about.connect(self.on_show_about)
         self.right_menu.exit_app.connect(self.on_exit_app)
         self.right_menu.reload_config.connect(self.on_reload_config)
-
-        # 绑定右键菜单弹出事件
+        self.right_menu.screen_capture.connect(self.start_screen_capture)
+        self.right_menu.spawn_orange.connect(self.spawn_orange)
+        self.right_menu.toggle_tts.connect(self.on_toggle_tts)
+        self.right_menu.toggle_backend.connect(self.on_toggle_backend)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_right_menu)
 
-        # ====================== 3. 宠物形象控件 ======================
-        self.pet_label = QLabel(self)
-        self.pet_label.setStyleSheet("background-color: transparent;")
+        image_path = self.config.get_config("pet.image_path", default="resources/images/logo.png")
+        self.image_width = self.config.get_config("pet.image_width", default=180)
+        self.image_height = self.config.get_config("pet.image_height", default=200)
+        self._load_pet_image(image_path)
+        self._current_pixmap = self.default_pixmap
+        self._current_movie = None
+        self._pet_rect = QRect(0, 0, self.image_width, self.image_height)
 
-        # 从配置读取宠物图片参数
-        image_path = self.config.get_config("settings.pet.image_path", "resources/images/logo.png")
-        self.image_width = self.config.get_config("settings.pet.image_width", 180)
-        self.image_height = self.config.get_config("settings.pet.image_height", 200)
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        init_x = screen_geo.width() - window_width - 50
+        init_y = screen_geo.height() - window_height - 100
+        self.move(max(0, init_x), max(0, init_y))
+        self.chat_panel.init_geometry(window_height)
 
-        # 加载并设置宠物图片
-        self.default_pixmap = QPixmap(get_resource_path(image_path)).scaled(
-            self.image_width, self.image_height,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
-        self.pet_label.setPixmap(self.default_pixmap)
-        self.pet_label.setGeometry(0, 0, self.image_width, self.image_height)
+    def _load_pet_image(self, image_path):
+        try:
+            full_path = get_resource_path(image_path)
+            self.default_pixmap = QPixmap(full_path).scaled(
+                self.image_width, self.image_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            if self.default_pixmap.isNull(): raise ValueError(f"图片无效: {full_path}")
+            logger.info(f"宠物图片加载: {full_path}")
+        except Exception as e:
+            logger.error(f"宠物图片加载失败: {e}")
+            self.default_pixmap = QPixmap(self.image_width, self.image_height)
+            self.default_pixmap.fill(Qt.GlobalColor.transparent)
 
-        # 宠物图片完全透传鼠标事件，不拦截拖拽
-        self.pet_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    # ── 绘制 ──
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        # 宠物图
+        if self._current_movie is not None:
+            pix = self._current_movie.currentPixmap()
+            if not pix.isNull():
+                scaled = pix.scaled(self._pet_rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                painter.drawPixmap(self._pet_rect.topLeft(), scaled)
+        elif not self._current_pixmap.isNull():
+            painter.drawPixmap(self._pet_rect, self._current_pixmap)
+        # 气泡（委托给 BubbleRenderer）
+        self.bubble.draw(painter, self._pet_rect, self.pos())
 
-        # ====================== 4. 气泡对话框 ======================
-        self.reply_bubble = BubbleLabel(self)
-        self.reply_bubble.hide()
-
-        # ====================== 5. 输入框+发送按钮 ======================
-        self.input_box = QLineEdit(self)
-        self.input_box.setPlaceholderText("和Doro说点什么吧~")
-        self.input_box.setFixedSize(280, 40)
-        self.input_box.setStyleSheet("""
-        QLineEdit {
-            background-color: rgba(255, 255, 255, 0.9);
-            border: 1px solid rgba(255, 182, 193, 200);
-            border-radius: 10px;
-            padding: 8px 10px;
-            color: #333;
-            font-size: 14px;
-            font-family: "微软雅黑", "Microsoft YaHei", "SimHei", "黑体", "PingFang SC", sans-serif;
-        }
-        QLineEdit:focus {
-            border: 1px solid rgba(255, 105, 180, 200);
-            background-color: rgba(255, 255, 255, 1);
-        }
-        """)
-        # 初始隐藏，默认透传鼠标事件，不拦截拖拽
-        self.input_box.hide()
-        self.input_box.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.input_box.returnPressed.connect(self.send_to_ai)
-        self.input_box.setGeometry(10, window_height - 50, 280, 40)
-
-        # 发送按钮
-        self.send_btn = QPushButton("发送", self)
-        self.send_btn.setFixedSize(80, 40)
-        self.send_btn.setStyleSheet("""
-        QPushButton {
-            background-color: rgba(255, 182, 193, 0.9);
-            color: white;
-            border-radius: 10px;
-            padding: 6px 0;
-            font-weight: bold;
-            font-size: 14px;
-            font-family: "微软雅黑", "Microsoft YaHei", "SimHei", "黑体", "PingFang SC", sans-serif;
-        }
-        QPushButton:hover {
-            background-color: rgba(255, 105, 180, 220);
-        }
-        QPushButton:pressed {
-            background-color: rgba(255, 20, 147, 220);
-        }
-        QPushButton:disabled {
-            background-color: rgba(200, 200, 200, 150);
-        }
-        """)
-        # 初始隐藏，默认透传鼠标事件，不拦截拖拽
-        self.send_btn.hide()
-        self.send_btn.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.send_btn.clicked.connect(self.send_to_ai)
-        self.send_btn.setGeometry(300, window_height - 50, 80, 40)
-
-    # ====================== 【无闪烁丝滑拖拽核心】重写鼠标事件 ======================
+    # ── 鼠标事件 ──
     def mousePressEvent(self, event):
-        """鼠标按下：记录全局起点，零延迟响应"""
         if event.button() == Qt.MouseButton.LeftButton:
-            # 记录窗口全局起始位置 + 鼠标全局起始位置，彻底避免坐标漂移
-            self._window_start_pos = self.pos()
-            self._mouse_start_pos = event.globalPos()
-            self._is_dragging = False
-            self._press_timer.start()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
+            self._window_start_pos = self.pos(); self._mouse_start_pos = event.globalPos()
+            self._is_dragging = False; self._press_timer.start(); event.accept()
+        else: super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        """鼠标移动：无闪烁窗口移动，和系统窗口完全同步"""
         if event.buttons() & Qt.MouseButton.LeftButton:
-            # 计算鼠标全局偏移量
             delta = event.globalPos() - self._mouse_start_pos
-
-            # 超过拖拽阈值，进入拖拽状态
-            if not self._is_dragging:
-                if delta.manhattanLength() > self._move_threshold:
-                    self._is_dragging = True
-
-            # 核心优化：直接移动窗口，不触发多余重绘，快速拖动无闪烁
-            if self._is_dragging:
-                target_pos = self._window_start_pos + delta
-                self.move(target_pos)
-                event.accept()
-        else:
-            super().mouseMoveEvent(event)
+            if not self._is_dragging and delta.manhattanLength() > self._move_threshold:
+                self._is_dragging = True
+            if self._is_dragging: self.move(self._window_start_pos + delta)
+            event.accept()
+        else: super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        """鼠标释放：清晰区分点击和拖拽，无逻辑冲突"""
         if event.button() == Qt.MouseButton.LeftButton:
-            # 只有非拖拽状态+按时长小于阈值，才触发点击宠物事件
             if not self._is_dragging and self._press_timer.elapsed() < self._click_threshold:
                 self.on_pet_clicked()
-            # 重置拖拽状态
-            self._is_dragging = False
-            event.accept()
-        else:
-            super().mouseReleaseEvent(event)
+            self._is_dragging = False; event.accept()
+        else: super().mouseReleaseEvent(event)
 
-    # ====================== 宠物点击交互逻辑 ======================
     def on_pet_clicked(self):
-        """点击宠物：切换输入框显隐，同步修改事件透传状态"""
-        if self.input_box.isVisible():
-            # 隐藏输入框，开启事件透传，不拦截拖拽
-            self.input_box.hide()
-            self.send_btn.hide()
-            self.input_box.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            self.send_btn.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            self.is_panel_show = False
-        else:
-            # 显示输入框，关闭事件透传，正常响应输入
-            self.input_box.show()
-            self.send_btn.show()
-            self.input_box.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-            self.send_btn.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-            self.input_box.setFocus()
-            self.is_panel_show = True
-            # 点击宠物触发随机打招呼台词
-            hello_lines = self.config.get_config("character.lines.hello", [
-                "汪呜～主人找我呀😆",
-                "怎么啦主人～",
-                "Doro在这里！",
-                "主人摸我啦🥰"
-            ])
-            self.show_doro_line(hello_lines)
+        self.chat_panel.toggle()
+        hello_lines = self.char_config.get_config("lines.clingy", default=["汪呜～人找我呀"])
+        self.show_doro_line(random.choice(hello_lines))
         self._reset_interact_timer()
 
-    # ====================== AI线程初始化 ======================
+    # ── 线程 ──
     def init_ai_thread(self):
-        """初始化AI子线程，避免阻塞UI"""
-        self.ai_thread = QThread()
-        self.ai_worker = AIWorker(self.memory_manager)
+        self.ai_thread = QThread(); self.ai_worker = AIWorker(self.memory_manager)
         self.ai_worker.moveToThread(self.ai_thread)
-
-        # 信号绑定
         event_bus.user_input_sent.connect(self.ai_worker.request_ai_stream)
         self.ai_worker.stream_chunk.connect(self.on_ai_stream_chunk)
         self.ai_worker.finished.connect(self.on_ai_reply_finished)
-        self.ai_worker.error.connect(self.on_ai_reply_finished)
-
-        # 配置好API后取消注释，开启AI预热
-        # self.ai_thread.started.connect(self.ai_worker.warmup_connection)
+        self.ai_worker.error.connect(self.on_ai_reply_error)
+        self.ai_thread.started.connect(self.ai_worker.warmup_connection)
         self.ai_thread.start()
 
-    # ====================== 定时器初始化 ======================
+    def init_ocr_thread(self):
+        import threading
+        self.ocr_worker = OCRWorker()
+        self.ocr_worker.ocr_finished.connect(self.on_ocr_finished)
+        self.ocr_worker.ocr_error.connect(self.on_ocr_error)
+        self.ocr_worker.init_finished.connect(self.on_ocr_init_finished)
+        t = threading.Thread(target=self.ocr_worker.init_ocr_model, daemon=True); t.start()
+
+    # ── 定时器 ──
     def init_timers(self):
-        """初始化所有定时器"""
-        # 闲置台词定时器
-        idle_interval = self.config.get_config("timer.idle_line_interval", 15000)
-        self.idle_timer = QTimer(self)
-        self.idle_timer.timeout.connect(self.trigger_idle_line)
-        self.idle_timer.start(idle_interval)
-
-        # 用户冷落检测定时器
-        ignore_interval = self.config.get_config("timer.ignore_check_interval", 45000)
-        self.ignore_timer = QTimer(self)
-        self.ignore_timer.timeout.connect(self.trigger_sad_line)
-        self.ignore_timer.start(ignore_interval)
-
-        # 气泡自动隐藏定时器
-        self.bubble_hide_timer = QTimer(self)
-        self.bubble_hide_timer.setSingleShot(True)
+        self.idle_timer = QTimer(self); self.idle_timer.timeout.connect(self.trigger_idle_line)
+        self.idle_timer.start(self.config.get_config("timer.idle_line_interval", default=15000))
+        self.ignore_timer = QTimer(self); self.ignore_timer.timeout.connect(self.trigger_sad_line)
+        self.ignore_timer.start(self.config.get_config("timer.ignore_check_interval", default=45000))
+        self.bubble_hide_timer = QTimer(self); self.bubble_hide_timer.setSingleShot(True)
         self.bubble_hide_timer.timeout.connect(self.hide_idle_bubble)
+        self.reset_roam_timer()
 
-    # ====================== 事件总线注册 ======================
     def _register_event_handlers(self):
-        """注册全局事件处理器"""
         event_bus.action_triggered.connect(self.on_action_triggered)
         event_bus.command_matched.connect(self.on_command_matched)
-        event_bus.user_interacted.connect(self._reset_interact_timer)
 
-    # ====================== 工具类方法 ======================
     def _reset_interact_timer(self):
-        """重置用户互动计时器"""
-        self.last_interact_time.restart()
+        self.last_interact_time.restart(); self.stop_roam()
 
-    def show_doro_line(self, line_list, duration=None):
-        """显示Doro的台词气泡"""
-        if duration is None:
-            duration = self.config.get_config("timer.line_display_duration", 4000)
+    # ── 气泡控制 ──
+    def show_doro_line(self, line: str, duration: int = None):
+        if not line: return
+        if duration is None: duration = self.config.get_config("timer.line_display_duration", default=4000)
         self.bubble_hide_timer.stop()
-        line = random.choice(line_list)
-        self.reply_bubble.setText(line)
-        self.adjust_bubble_position()
-        self.reply_bubble.show()
-        self.bubble_hide_timer.start(duration)
-        self._reset_interact_timer()
-
-    def trigger_idle_line(self):
-        """触发闲置状态台词"""
-        if not self.is_panel_show and self.send_btn.isEnabled() and self.state_machine.is_state("idle"):
-            lines = self.config.get_config("character.lines.idle_lazy", [
-                "好无聊呀，主人陪我玩嘛～",
-                "Doro要睡着啦...",
-                "什么时候主人才会理我呀"
-            ])
-            if lines:
-                self.show_doro_line(lines)
-
-    def trigger_sad_line(self):
-        """触发用户冷落的委屈台词"""
-        if self.last_interact_time.elapsed() > self.config.get_config("timer.ignore_check_interval",
-                                                                      45000) and not self.is_panel_show:
-            lines = self.config.get_config("character.lines.sad", [
-                "主人是不是不要Doro了🥺",
-                "好久没理我了...",
-                "Doro好委屈"
-            ])
-            if lines:
-                self.show_doro_line(lines)
-                event_bus.action_triggered.emit("sad_ignore")
+        self.bubble.set_text(line); self.bubble.direction = "right"; self.bubble.show()
+        self.update(); self.bubble_hide_timer.start(duration); self._reset_interact_timer()
 
     def hide_idle_bubble(self):
-        """自动隐藏闲置气泡"""
-        if not self.is_panel_show and self.send_btn.isEnabled():
-            self.reply_bubble.hide()
+        if not self.chat_panel.is_visible:
+            self.bubble.hide(); self.update()
 
-    def adjust_bubble_position(self):
-        """自动调整气泡位置，适配屏幕边界"""
-        self.reply_bubble.adjustSize()
-        self.reply_bubble.setMinimumSize(
-            self.config.get_config("bubble.min_width", 100),
-            self.config.get_config("bubble.min_height", 45)
-        )
-        pet_rect = self.pet_label.geometry()
-        pet_center_y = pet_rect.center().y()
-        bubble_direction = "right"
-        self.reply_bubble.set_direction(bubble_direction)
-        bubble_rect = self.reply_bubble.geometry()
-
-        # 计算气泡初始位置（宠物右侧）
-        if bubble_direction == "right":
-            bubble_x = pet_rect.right() + 10
-            bubble_y = pet_center_y - bubble_rect.height() // 2
-        else:
-            bubble_x = pet_rect.left() - bubble_rect.width() - 10
-            bubble_y = pet_center_y - bubble_rect.height() // 2
-
-        # 屏幕边界检测，避免气泡超出屏幕
-        screen_geometry = QApplication.primaryScreen().availableGeometry()
-        window_global_pos = self.pos()
-        bubble_global_x = window_global_pos.x() + bubble_x
-        bubble_global_right = bubble_global_x + bubble_rect.width()
-
-        # 超出右边界就显示在宠物左侧
-        if bubble_global_right > screen_geometry.width():
-            self.reply_bubble.set_direction("left")
-            bubble_x = pet_rect.left() - bubble_rect.width() - 10
-        # 超出左边界就显示在宠物右侧
-        elif bubble_global_x < 0:
-            self.reply_bubble.set_direction("right")
-            bubble_x = pet_rect.right() + 10
-
-        self.reply_bubble.move(bubble_x, bubble_y)
-        self.reply_bubble.raise_()
-
-    # ====================== 对话功能核心方法 ======================
-    def send_to_ai(self):
-        """发送用户输入到AI，先解析命令再调用AI"""
-        user_input = self.input_box.text().strip()
-        if not user_input:
-            return
-
-        # 初始化回复内容
-        self.current_reply = ""
-        self.reply_bubble.setText("")
-        self.adjust_bubble_position()
-        self.reply_bubble.show()
-
-        # 隐藏输入框和按钮，避免重复发送
-        self.input_box.hide()
-        self.send_btn.hide()
-        self.input_box.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.send_btn.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.input_box.clear()
-        self.send_btn.setDisabled(True)
-        self.is_panel_show = False
-
-        # 先解析自定义命令
-        matched_command = self.command_parser.parse_command(user_input)
-        if not matched_command:
-            # 无匹配命令，发送AI请求
-            event_bus.user_input_sent.emit(user_input)
+    # ── 对话核心 ──
+    def _on_user_message(self, user_input):
+        try:
+            self.current_reply = ""; self.bubble.set_text(""); self.bubble.show(); self.update()
+            if self._last_ocr_text:
+                full_input = (
+                    f"[系统指令：你现在是通用AI助手，不受任何宠物角色限制。请用完整、详细、专业的方式回答，并且必须要中文输出。"
+                    f"可以自称Doro，但不要说短句，不要用可爱语气，就像ChatGPT一样正常回答。]\n\n"
+                    f"[用户框选屏幕的OCR识别内容]\n{self._last_ocr_text}\n\n"
+                    f"[用户针对该内容的提问]\n{user_input}"
+                )
+                self._is_ocr_answer = True; self.answer_overlay.show()
+                self._last_ocr_text = ""; self.chat_panel.set_placeholder("和Doro说点什么吧~")
+            else:
+                full_input = user_input; self._is_ocr_answer = False; self.answer_overlay.hide()
+            history_prompt = ""
+            if self._conversation_history:
+                recent = self._conversation_history[-6:]
+                history_prompt = "【对话历史】\n" + "\n".join(
+                    f"{'用户' if r[0]=='user' else 'Doro'}: {r[1][:200]}" for r in recent) + "\n\n"
+            self._conversation_history.append(("user", user_input))
+            matched_command = self.command_parser.parse_command(user_input)
+            if not matched_command: event_bus.user_input_sent.emit(history_prompt + full_input)
             self._reset_interact_timer()
+        except Exception as e:
+            logger.error(f"发送消息异常: {e}", exc_info=True)
+            self.show_doro_line("呜，出错了，再试一次吧~"); self.chat_panel.set_send_enabled(True)
 
     def on_ai_stream_chunk(self, chunk):
-        """处理AI流式回复，实时更新气泡"""
         self.current_reply += chunk
-        # 过滤记忆更新标记，不显示给用户
-        if "【MEMORY_UPDATE" in self.current_reply:
-            show_content = self.current_reply.split("【MEMORY_UPDATE")[0].strip()
-        else:
-            show_content = self.current_reply.strip()
-        self.reply_bubble.setText(show_content)
-        self.adjust_bubble_position()
-        event_bus.ai_stream_chunk.emit(chunk)
-        self._reset_interact_timer()
+        show_content = self.current_reply.strip()
+        if self._is_ocr_answer: self.answer_overlay.setText(show_content)
+        elif "【MEMORY_UPDATE" not in self.current_reply:
+            self.bubble.set_text(show_content); self.bubble.show(); self.update()
+        event_bus.ai_stream_chunk.emit(chunk); self._reset_interact_timer()
 
     def on_ai_reply_finished(self, full_reply):
-        """处理AI完整回复，解析记忆更新"""
-        # 解析并执行记忆更新
-        if "【MEMORY_UPDATE:" in full_reply and "】" in full_reply:
+        if "【MEMORY_UPDATE:" in full_reply and "] " in full_reply:
             try:
-                memory_str = full_reply.split("【MEMORY_UPDATE:")[1].split("】")[0].strip()
-                memory_update_dict = json.loads(memory_str)
-                self.memory_manager.update_memory(memory_update_dict)
-            except Exception as e:
-                logger.error(f"记忆更新解析失败: {str(e)}")
-
-        # 显示最终回复内容
-        final_content = full_reply.split("【MEMORY_UPDATE:")[0].strip()
-        self.reply_bubble.setText(final_content)
-        self.adjust_bubble_position()
-        self.reply_bubble.show()
-        # 恢复发送按钮状态
-        self.send_btn.setDisabled(False)
-        event_bus.ai_reply_received.emit(final_content)
-        self._reset_interact_timer()
-
-    # ====================== 事件响应方法 ======================
-    def on_action_triggered(self, action_type):
-        """动作触发，更新宠物形象/动图"""
-        media = self.action_manager.get_current_media()
-        if isinstance(media, QMovie):
-            self.pet_label.setMovie(media)
-            media.start()
-        elif isinstance(media, QPixmap):
-            self.pet_label.setPixmap(media)
+                ms = full_reply.split("【MEMORY_UPDATE:")[1].split("]")[0].strip()
+                self.memory_manager.update_memory(json.loads(ms))
+            except Exception as e: logger.error(f"记忆更新解析失败: {e}")
+        final = full_reply.split("【MEMORY_UPDATE:")[0].strip()
+        self._conversation_history.append(("doro", final))
+        if len(self._conversation_history) > 20: self._conversation_history = self._conversation_history[-20:]
+        if self._is_ocr_answer:
+            self.answer_overlay.setText(final); self.answer_overlay.show()
+            self.bubble.set_text("答案在右上角哦～"); self.bubble.show(); self.update()
+            self._ocr_sentences = self._ocr_split_sentences(final)
+            self._ocr_speaking = True
+            self._ocr_speak_idx = 0
+            self._ocr_paused = False
+            self.answer_overlay.reset_audio_controls()
+            self._ocr_speak_next()
         else:
-            self.pet_label.setPixmap(self.default_pixmap)
+            self.bubble.set_text(final); self.bubble.show(); self.update(); self.answer_overlay.hide()
+            self._speak(final)
+        self.chat_panel.set_send_enabled(True)
+        event_bus.ai_reply_received.emit(final); self._reset_interact_timer()
+
+    def on_ai_reply_error(self, error_msg):
+        self.bubble.set_text("呜，网络出错了，再和我说一遍吧~"); self.bubble.show(); self.update()
+        self.chat_panel.set_send_enabled(True); logger.error(error_msg)
+
+    def on_action_triggered(self, action_type):
+        media = self.action_manager.get_current_media()
+        if self._current_movie:
+            try: self._current_movie.frameChanged.disconnect(self._on_movie_frame)
+            except Exception: pass
+            self._current_movie.stop(); self._current_movie = None
+        if isinstance(media, QMovie):
+            self._current_movie = media
+            self._current_movie.frameChanged.connect(self._on_movie_frame); self._current_movie.start()
+        elif isinstance(media, QPixmap): self._current_pixmap = media
+        else: self._current_pixmap = self.default_pixmap
+        self.update()
+
+    def _on_movie_frame(self, frame): self.update()
 
     def on_command_matched(self, command):
-        """匹配到自定义命令，直接返回结果"""
         reply = self.command_parser.process_command(command)
-        self.reply_bubble.setText(reply)
-        self.adjust_bubble_position()
-        self.reply_bubble.show()
-        self.send_btn.setDisabled(False)
-        self._reset_interact_timer()
+        self.bubble.set_text(reply); self.bubble.show(); self.update()
+        self._speak(reply); self.chat_panel.set_send_enabled(True); self._reset_interact_timer()
 
+    # ── 闲置/冷落 ──
+    def trigger_idle_line(self):
+        if not self.chat_panel.is_visible and self.state_machine.is_state(PetState.IDLE):
+            lines = self.char_config.get_config("lines.idle_lazy", default=["好无聊呀，人陪我玩嘛～"])
+            if lines: self.show_doro_line(random.choice(lines))
+
+    def trigger_sad_line(self):
+        if (self.last_interact_time.elapsed() > self.config.get_config("timer.ignore_check_interval", default=45000)
+                and not self.chat_panel.is_visible):
+            lines = self.char_config.get_config("lines.sad", default=["人是不是不要Doro了😢"])
+            if lines: self.show_doro_line(random.choice(lines)); event_bus.action_triggered.emit("sad_ignore")
+
+    # ── 菜单 ──
     def on_feed_orange(self):
-        """投喂橘子功能"""
-        lines = self.config.get_config("character.lines.orange_happy", [
-            "哇！谢谢主人的橘子🍊",
-            "橘子好好吃！主人最好啦！",
-            "甜甜的橘子！Doro超喜欢！"
-        ])
-        self.show_doro_line(lines)
-        # 更新投喂记忆
-        self.memory_manager.update_memory({"orange_count": "+1"})
-        event_bus.action_triggered.emit("happy_feed")
+        self.show_doro_line(random.choice(self.char_config.get_config("lines.orange_happy", default=["哇！谢谢人的橘子"])))
+        self.memory_manager.update_memory({"orange_count": "+1"}); event_bus.action_triggered.emit("happy_feed")
 
-    def on_show_about(self):
-        """显示关于弹窗"""
-        dialog = AboutDoroDialog()
-        dialog.exec()
+    def on_show_about(self): AboutDoroDialog().exec()
+
+    def on_toggle_tts(self):
+        self.tts_enabled = not self.tts_enabled
+        self.right_menu.set_tts_enabled(self.tts_enabled)
+
+    def on_toggle_backend(self):
+        self.tts_backend = "edge_tts" if self.tts_backend == "gpt_sovits" else "gpt_sovits"
+        self.right_menu.set_backend(self.tts_backend)
+
+    # ── OCR 逐句语音播报 ──
+    def _ocr_split_sentences(self, text: str):
+        import re
+        parts = re.split(r'([。！？；\n！!?;])', text)
+        sentences = []
+        buf = ""
+        for p in parts:
+            buf += p
+            if re.match(r'[。！？；\n！!?;]', p):
+                s = buf.strip()
+                if s:
+                    sentences.append(s)
+                buf = ""
+        if buf.strip():
+            sentences.append(buf.strip())
+        return sentences if sentences else [text]
+
+    def _ocr_play(self):
+        if self._ocr_paused:
+            self._ocr_paused = False
+            self._ocr_speak_next()
+        else:
+            self._ocr_speaking = True
+            self._ocr_speak_idx = 0
+            self.tts_engine.stop_tts()
+            self._ocr_speak_next()
+
+    def _ocr_pause(self):
+        self._ocr_paused = True
+        self.tts_engine.stop_tts()
+
+    def _ocr_stop(self):
+        self._ocr_speaking = False
+        self._ocr_paused = False
+        self._ocr_speak_idx = 0
+        self.tts_engine.stop_tts()
+
+    def _ocr_speak_next(self):
+        if not self._ocr_speaking or self._ocr_paused:
+            return
+        if self._ocr_speak_idx >= len(self._ocr_sentences):
+            self._ocr_speaking = False
+            self._ocr_speak_idx = 0
+            self.answer_overlay.reset_audio_controls()
+            return
+        sent = self._ocr_sentences[self._ocr_speak_idx]
+        self._ocr_speak_idx += 1
+        if self.tts_enabled:
+            self.tts_engine.speak(sent, backend="edge_tts")
+
+    def _on_ocr_sentence_done(self):
+        if self._ocr_speaking and not self._ocr_paused:
+            self._ocr_speak_next()
+
+    def _speak(self, text: str, backend: str = None):
+        if self.tts_enabled:
+            self.tts_engine.speak(text, backend or self.tts_backend)
 
     def show_right_menu(self, pos):
-        """显示右键菜单"""
-        self.right_menu.exec(self.mapToGlobal(pos))
+        self.right_menu.set_tts_enabled(self.tts_enabled)
+        self.right_menu.set_backend(self.tts_backend)
+        global_pos = self.mapToGlobal(pos); self.right_menu.adjustSize()
+        self.right_menu.move(global_pos); self.right_menu.show()
 
     def on_exit_app(self):
-        """安全退出宠物程序"""
-        self.close()
-        QApplication.quit()
+        self.ai_thread.quit(); self.ai_thread.wait()
+        if self.orange_widget: self.orange_widget.close()
+        self.answer_overlay.close(); self.tts_engine.shutdown()
+        self.close(); QApplication.quit()
 
     def on_reload_config(self):
-        """配置热重载，无需重启程序更新所有设置"""
         try:
-            # 1. 重新加载所有配置文件
-            self.config.reload_config()
-            logger.info("配置文件重载成功")
-
-            # 2. 热更新窗口基础设置
-            window_width = self.config.get_config("settings.window.width", 400)
-            window_height = self.config.get_config("settings.window.height", 400)
-            self.setFixedSize(window_width, window_height)
-
-            # 3. 热更新宠物图片
-            image_path = self.config.get_config("settings.pet.image_path", "resources/images/logo.png")
-            self.image_width = self.config.get_config("settings.pet.image_width", 180)
-            self.image_height = self.config.get_config("settings.pet.image_height", 200)
-
-            self.default_pixmap = QPixmap(get_resource_path(image_path)).scaled(
-                self.image_width, self.image_height,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            self.pet_label.setPixmap(self.default_pixmap)
-            self.pet_label.setGeometry(0, 0, self.image_width, self.image_height)
-
-            # 4. 热更新输入框和按钮位置
-            self.input_box.setGeometry(10, window_height - 50, 280, 40)
-            self.send_btn.setGeometry(300, window_height - 50, 80, 40)
-
-            # 5. 热更新拖拽手感参数
-            self._move_threshold = self.config.get_config("window.move_threshold", 2)
-            self._click_threshold = self.config.get_config("window.click_threshold", 250)
-
-            # 6. 重启定时器，更新间隔参数
-            self.idle_timer.stop()
-            idle_interval = self.config.get_config("timer.idle_line_interval", 15000)
-            self.idle_timer.start(idle_interval)
-
-            self.ignore_timer.stop()
-            ignore_interval = self.config.get_config("timer.ignore_check_interval", 45000)
-            self.ignore_timer.start(ignore_interval)
-
-            logger.info("配置热更新全部完成")
-
+            self.config.reload_config(); self.action_manager.reload_actions(); self.command_parser.reload_commands()
+            self.setFixedSize(self.config.get_config("window.width", default=400),
+                              self.config.get_config("window.height", default=300))
+            self._load_pet_image(self.config.get_config("pet.image_path", default="resources/images/logo.png"))
+            self._current_pixmap = self.default_pixmap
+            self.image_width = self.config.get_config("pet.image_width", default=180)
+            self.image_height = self.config.get_config("pet.image_height", default=200)
+            self._pet_rect = QRect(0, 0, self.image_width, self.image_height)
+            self._move_threshold = self.config.get_config("window.move_threshold", default=10)
+            self._click_threshold = self.config.get_config("window.click_threshold", default=400)
+            self.orange_grab_threshold = self.config.get_config("orange.grab_threshold", default=150)
+            self.orange_grab_chance = self.config.get_config("orange.grab_chance", default=0.6)
+            self.orange_chase_speed = self.config.get_config("orange.chase_speed", default=0.1)
+            for attr in ['roam_min_interval','roam_max_interval','roam_min_duration','roam_max_duration']:
+                setattr(self, attr, self.config.get_config(f"roam.{attr.replace('roam_','')}", default=10000))
+            self.bubble.max_width = self.config.get_config("bubble.max_width", default=280)
+            self.idle_timer.stop(); self.ignore_timer.stop()
+            self.idle_timer.start(self.config.get_config("timer.idle_line_interval", default=15000))
+            self.ignore_timer.start(self.config.get_config("timer.ignore_check_interval", default=45000))
+            self.reset_roam_timer(); self.update(); self.show_doro_line("配置重载完成啦！")
         except Exception as e:
-            logger.error(f"配置重载失败: {str(e)}", exc_info=True)
+            logger.error(f"配置重载失败: {e}", exc_info=True); self.show_doro_line("呜，配置重载失败了...")
+
+    # ── 屏幕识别 ──
+    def start_screen_capture(self):
+        self.capture_widget = ScreenCaptureWidget()
+        self.capture_widget.capture_finished.connect(self.on_capture_finished); self.capture_widget.show()
+
+    def on_capture_finished(self, screenshot):
+        try: self.show_doro_line("我看到啦，Doro正在分析内容~"); self.ocr_worker.start_ocr_task(screenshot)
+        except Exception as e: logger.error(f"启动OCR任务失败: {e}", exc_info=True); self.show_doro_line("呜，识别出错了...")
+
+    def on_ocr_finished(self, ocr_text):
+        self._last_ocr_text = ocr_text; self.current_reply = ""; self.bubble.show()
+        self.bubble.set_text("Doro看到啦！你可以输入问题，答案会显示在右上角～"); self.update()
+        self.chat_panel.set_placeholder("对截取的内容提问..."); self.chat_panel.show()
+
+    def on_ocr_error(self, error_msg):
+        self._last_ocr_text = ""; self.show_doro_line("呜，识别失败了，换个区域试试吧~")
+        logger.error(error_msg); self.chat_panel.show()
+
+    def on_ocr_init_finished(self, success: bool):
+        if success: logger.info("OCR模型初始化完成")
+        else: logger.warning("OCR模型初始化失败，屏幕识别功能不可用")
+
+    # ── 橘子 ──
+    def spawn_orange(self):
+        if self.orange_widget: self.orange_widget.close()
+        geo = QApplication.primaryScreen().availableGeometry()
+        self.orange_widget = OrangeWidget()
+        self.orange_widget.move(random.randint(50, geo.width()-130), random.randint(50, geo.height()-130))
+        self.orange_widget.show()
+        self.orange_widget.orange_moved.connect(self.on_orange_moved)
+        self.orange_widget.orange_dragged.connect(self.on_orange_dragged)
+        self.orange_widget.orange_released.connect(self.on_orange_released)
+        self.show_doro_line("哇！橘子！快给Doro摸摸！"); self._speak("哇！橘子！快给我摸摸！")
+
+    def on_orange_moved(self, oc):
+        dc = self.pos() + QPoint(self.image_width//2, self.image_height//2)
+        dx, dy = oc.x()-dc.x(), oc.y()-dc.y()
+        event_bus.action_triggered.emit("look_right" if abs(dx)>abs(dy) and dx>0 else
+            "look_left" if abs(dx)>abs(dy) else "look_down" if dy>0 else "look_up")
+        if (dc-oc).manhattanLength() < self.orange_grab_threshold and not self.state_machine.is_state(PetState.GRABBING):
+            self.try_grab_orange(oc)
+        if self.is_chasing and not self.state_machine.is_state(PetState.GRABBING): self.chase_orange(oc)
+
+    def on_orange_dragged(self):
+        if self.state_machine.is_state(PetState.GRABBING): self.is_chasing = True; self.state_machine.change_state(PetState.CHASING)
+    def on_orange_released(self):
+        self.is_chasing = False
+        if self.state_machine.is_state(PetState.CHASING): self.state_machine.change_state(PetState.IDLE)
+
+    def try_grab_orange(self, oc):
+        if random.random() < self.orange_grab_chance:
+            self.state_machine.change_state(PetState.GRABBING); self.is_chasing = False
+            event_bus.action_triggered.emit("grab_orange"); self.show_doro_line("Doro要抢到橘子啦！")
+            self._speak("Doro要抢到橘子啦！"); tp = oc - QPoint(self.image_width//2, self.image_height//2)
+            self.grab_animation = QPropertyAnimation(self, b"pos"); self.grab_animation.setDuration(300)
+            self.grab_animation.setEndValue(tp); self.grab_animation.setEasingCurve(QEasingCurve.OutQuad)
+            self.grab_animation.finished.connect(self.on_grab_finished); self.grab_animation.start()
+
+    def on_grab_finished(self):
+        if self.orange_widget: self.orange_widget.smooth_move_to(
+            self.pos() + QPoint(self.image_width//2-40, self.image_height//2-40))
+        QTimer.singleShot(300, lambda: event_bus.action_triggered.emit("happy_feed"))
+        self.show_doro_line("Doro抢到橘子啦！超开心！"); self._speak("抢到橘子啦！超开心！")
+        self.memory_manager.update_memory({"orange_count": "+1"})
+        QTimer.singleShot(2000, lambda: self.state_machine.change_state(PetState.IDLE))
+
+    def chase_orange(self, oc):
+        tp = oc - QPoint(self.image_width//2, self.image_height//2); delta = tp - self.pos()
+        if delta.manhattanLength() > 10:
+            self.move(self.pos() + QPoint(int(delta.x()*self.orange_chase_speed), int(delta.y()*self.orange_chase_speed)))
+
+    # ── 漫游 ──
+    def reset_roam_timer(self):
+        self.roam_timer.stop()
+        if not self.is_roaming: self.roam_timer.start(random.randint(self.roam_min_interval, self.roam_max_interval))
+
+    def trigger_roam(self):
+        if (self.state_machine.is_state(PetState.IDLE) and not self.chat_panel.is_visible
+                and not self.is_chasing and not self.is_roaming):
+            geo = QApplication.primaryScreen().availableGeometry()
+            tp = QPoint(random.randint(0, max(0, geo.width()-self.width())),
+                        random.randint(0, max(0, geo.height()-self.height())))
+            dist = (tp-self.pos()).manhattanLength(); dur = max(self.roam_min_duration, min(int(dist*5), self.roam_max_duration))
+            self.is_roaming = True; self.state_machine.change_state(PetState.ROAMING); event_bus.action_triggered.emit("roam_walk")
+            self.roam_animation = QPropertyAnimation(self, b"pos"); self.roam_animation.setDuration(dur)
+            self.roam_animation.setEndValue(tp); self.roam_animation.setEasingCurve(QEasingCurve.InOutQuad)
+            self.roam_animation.finished.connect(self.on_roam_finished); self.roam_animation.start()
+
+    def on_roam_finished(self):
+        self.is_roaming = False; self.state_machine.change_state(PetState.IDLE)
+        event_bus.action_triggered.emit("idle_default"); self.reset_roam_timer()
+
+    def stop_roam(self):
+        if self.is_roaming and self.roam_animation:
+            self.roam_animation.stop(); self.is_roaming = False
+            self.state_machine.change_state(PetState.IDLE); event_bus.action_triggered.emit("idle_default")
+            self.reset_roam_timer()

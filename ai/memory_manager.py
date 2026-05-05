@@ -9,7 +9,7 @@ class MemoryManager(QObject):
     def __init__(self):
         super().__init__()
         config = ConfigLoader()
-        self.memory_file = get_memory_path(config.get_config("memory.memory_file", "user_memory.json"))
+        self.memory_file = get_memory_path(config.get_config("memory.memory_file", default="user_memory.json"))
         self.memory_data = {
             "user_name": "",
             "user_nickname": "",
@@ -45,7 +45,6 @@ class MemoryManager(QObject):
         """更新记忆"""
         for key, value in update_dict.items():
             if key in self.memory_data:
-                # 处理增量更新（比如橘子计数+1）
                 if isinstance(value, str) and value.startswith("+") and isinstance(self.memory_data[key], int):
                     try:
                         add_num = int(value[1:])

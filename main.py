@@ -3,39 +3,32 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QCoreApplication
 from ui.main_window import PetMainWindow
 from utils.logger import logger
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pygame.pkgdata")
 
+def _global_exception_hook(exc_type, exc_value, exc_tb):
+    import traceback
+    tb_text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    logger.critical(f"未捕获异常，进程即将退出:\n{tb_text}")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
 
-QCoreApplication.setAttribute(Qt.AA_UseDesktopOpenGL, True)
-
-
-try:
-
-    QApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-except AttributeError:
-    # 兼容PySide6旧版本
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-
-# 3. 渲染优化，避免窗口闪烁
-QApplication.setAttribute(Qt.AA_DontCreateNativeWidgetSiblings, True)
-
+sys.excepthook = _global_exception_hook
 
 def main():
-    logger.info("Doro桌面宠物启动中...")
-    # 初始化Qt应用
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except AttributeError:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    # 创建主窗口并显示
     window = PetMainWindow()
     window.show()
-    logger.info("Doro启动完成！")
 
-    # 启动应用事件循环
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()

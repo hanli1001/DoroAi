@@ -1,4 +1,3 @@
-# utils/logger.py 完整可直接用代码
 import logging
 
 # 全局单例logger实例，其他文件直接导入即可用

@@ -2,14 +2,15 @@ from PySide6.QtCore import QObject, Signal
 from utils.logger import logger
 from core.event_system import event_bus
 
-
 class PetState:
-    IDLE = "idle"  # 闲置
-    INTERACT = "interact"  # 交互中
-    DIALOG = "dialog"  # 对话中
-    EMOTION = "emotion"  # 情绪表达中
-    COMMAND = "command"  # 执行命令中
-
+    IDLE = "idle"
+    INTERACT = "interact"
+    DIALOG = "dialog"
+    EMOTION = "emotion"
+    COMMAND = "command"
+    GRABBING = "grabbing"
+    CHASING = "chasing"
+    ROAMING = "roaming"
 
 class PetStateMachine(QObject):
     state_changed = Signal(str)
@@ -21,7 +22,7 @@ class PetStateMachine(QObject):
 
     def _register_event_handlers(self):
         """注册事件处理器"""
-        event_bus.pet_clicked.connect(lambda _: self.change_state(PetState.INTERACT))
+        event_bus.pet_clicked.connect(lambda: self.change_state(PetState.INTERACT))
         event_bus.user_input_sent.connect(lambda _: self.change_state(PetState.DIALOG))
         event_bus.ai_reply_received.connect(lambda _: self.change_state(PetState.IDLE))
         event_bus.action_triggered.connect(lambda _: self.change_state(PetState.EMOTION))
@@ -32,17 +33,15 @@ class PetStateMachine(QObject):
         """切换状态"""
         if self.current_state == new_state:
             return
-
         old_state = self.current_state
         self.current_state = new_state
         logger.info(f"宠物状态切换: {old_state} -> {new_state}")
-
         self.state_changed.emit(new_state)
         event_bus.state_changed.emit(new_state)
 
     def _on_action_finished(self, action_id: str):
         """动作完成后自动切回闲置状态"""
-        if self.current_state in [PetState.EMOTION, PetState.COMMAND, PetState.INTERACT]:
+        if self.current_state in [PetState.EMOTION, PetState.COMMAND, PetState.INTERACT, PetState.GRABBING, PetState.CHASING, PetState.ROAMING]:
             self.change_state(PetState.IDLE)
 
     def is_state(self, state: str) -> bool:
